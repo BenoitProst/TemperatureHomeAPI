@@ -78,6 +78,21 @@ class CozyTouchTemperatureModele(Base):
     )
 
 
+class CozyTouchTemperature30minModele(Base):
+    __tablename__ = 'cozy_touch_temperature_30min'  # Nom de la table dans la base de données
+
+    id = Column(Integer, primary_key=True, autoincrement=True)  # Identifiant unique
+    piece = Column(String, nullable=False)  # Nom de la pièce
+    timestamp = Column(DateTime, nullable=False)  # Horodatage
+    moyenne_temperature = Column(Float, nullable=True)  # Température moyenne
+    ecart_type_temperature = Column(Float, nullable=True)  # Écart-type de la température
+    temperature_cible = Column(Float, nullable=True)  # Température cible
+    consommation = Column(Float, nullable=True)  # Consommation en énergie
+
+    # Contrainte unique sur le couple (timestamp, piece)
+    __table_args__ = (UniqueConstraint('timestamp', 'piece', name='uix_timestamp_piece'),)
+
+
 # Configurer une session pour interagir avec la base
 Session = sessionmaker(bind=engine)
 session = Session()
@@ -415,11 +430,11 @@ def XiaomiTemperature30min():
         
         # Commit pour appliquer les changements
         session.commit()
-        print("Les lignes de plus de 7 jours ont été supprimées avec succès.")
+        # print("Les lignes de plus de 7 jours ont été supprimées avec succès.")
     except Exception as e:
         # En cas d'erreur
         session.rollback()
-        print(f"Erreur lors de la suppression : {e}")
+        # print(f"Erreur lors de la suppression : {e}")
 
     # df_hist_30min = pd.read_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature30min_data.csv')
 
@@ -448,11 +463,34 @@ def XiaomiTemperature30min():
 
 
 def CozyTouch30min():
-    df = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv')
+    # df = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv')
+
+    # Calculer le timestamp il y a 6 heures
+    six_hours_ago = datetime.now() - timedelta(hours=6)
+
+    recent_entries = (
+        session.query(CozyTouchTemperatureModele)
+        .filter(CozyTouchTemperatureModele.timestamp >= six_hours_ago)
+        .all()
+    )
+
+    # Convertir les résultats en une liste de dictionnaires
+    data = [{
+        'id': entry.id,
+        'piece': entry.piece,
+        'timestamp': entry.timestamp,
+        'temperature': entry.temperature,
+        'temperature cible': entry.target_temperature,
+        'consommation': entry.consumption
+    } for entry in recent_entries]
+
+    # Créer un DataFrame
+    df = pd.DataFrame(data)
 
     # Convertir la colonne 'Timestamp' en type datetime avant de définir comme index
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    # df['timestamp'] = pd.to_datetime(df['timestamp'])
     # Définir 'Timestamp' comme index
+
     df.set_index('timestamp', inplace=True)
 
     df_aggregated = df.groupby(['piece']).resample('30min').agg(
@@ -464,19 +502,43 @@ def CozyTouch30min():
 
     df_aggregated['moyenne_temperature'] = df_aggregated['moyenne_temperature'].round(2)
 
-    df_hist_30min = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch30min_data.csv')
+    for _, row in df_aggregated.iterrows():
+        stmt = insert(CozyTouchTemperature30minModele).values(
+            piece=row['piece'],
+            timestamp=row['timestamp'],
+            moyenne_temperature=row['moyenne_temperature'],
+            ecart_type_temperature=row['ecart_type_temperature'],
+            temperature_cible=row['temperature_cible'],
+            consommation=row['consommation']
+        )
+        
+        # Si le couple (timestamp, piece) existe, met à jour les autres colonnes
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['timestamp', 'piece'],  # Clés pour détecter le conflit
+            set_={
+                'moyenne_temperature': stmt.excluded.moyenne_temperature,
+                'ecart_type_temperature': stmt.excluded.ecart_type_temperature,
+                'temperature_cible': stmt.excluded.temperature_cible,
+                'consommation': stmt.excluded.consommation,
+            }
+        )
+        session.execute(stmt)
+    
+    session.commit()
 
-    df_hist_30min['timestamp'] = pd.to_datetime(df_hist_30min['timestamp'])
+    # df_hist_30min = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch30min_data.csv')
+
+    # df_hist_30min['timestamp'] = pd.to_datetime(df_hist_30min['timestamp'])
 
 
-    df_new_30min = pd.concat([df_aggregated, df_hist_30min], ignore_index=False)
+    # df_new_30min = pd.concat([df_aggregated, df_hist_30min], ignore_index=False)
 
-    df_new_30min = df_new_30min.drop_duplicates(subset=['timestamp','piece'])
+    # df_new_30min = df_new_30min.drop_duplicates(subset=['timestamp','piece'])
 
-    df_new_30min = df_new_30min.sort_values(by='timestamp')
+    # df_new_30min = df_new_30min.sort_values(by='timestamp')
 
     # Exporter le DataFrame en fichier CSV
-    df_new_30min.to_csv('/home/pi/CozyTouchAPI/data/CozyTouch30min_data.csv', index=False)
+    # df_new_30min.to_csv('/home/pi/CozyTouchAPI/data/CozyTouch30min_data.csv', index=False)
 
     # Suppression des données détaillées de plus d'une semaine
 
@@ -484,9 +546,16 @@ def CozyTouch30min():
     one_week_ago = datetime.now() - timedelta(weeks=1)
 
     # Filtrer pour ne garder que les lignes dont l'index est postérieur à one_week_ago
-    df_filtered = df[df.index > one_week_ago]
+    # df_filtered = df[df.index > one_week_ago]
 
-    df_filtered.to_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv', index=True)
+    # df_filtered.to_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv', index=True)
+
+    # Filtrer et supprimer
+    session.query(CozyTouchTemperatureModele).filter(CozyTouchTemperatureModele.timestamp < one_week_ago).delete(synchronize_session=False)
+
+    # Commit pour appliquer les changements
+    session.commit()
+
 
 # Dictionnaire pour stocker les données de température
 temperature_data = {

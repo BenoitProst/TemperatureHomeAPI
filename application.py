@@ -12,14 +12,17 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import locale
 
+from pathlib import Path
+
 from sqlalchemy import create_engine, inspect, Column, String, Integer, MetaData, Table, DateTime
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, Table
-from sqlalchemy.orm import sessionmaker, relationship, backref
+from sqlalchemy.orm import sessionmaker, relationship, backref, scoped_session
 from sqlalchemy import exc
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.exc import OperationalError
 
 
 app = Flask(__name__)
@@ -97,147 +100,100 @@ class CozyTouchTemperature30minModele(Base):
 Session = sessionmaker(bind=engine)
 session = Session()
 
+# Création d'une session scoped
+SessionSc = scoped_session(sessionmaker(bind=engine))
+
 # Assurez-vous que la localisation en français est activée pour afficher les jours et mois en français
 locale.setlocale(locale.LC_TIME, 'fr_FR.UTF-8')
 
+
 def CleaningXiaomiTemp(deltajour):
-    
-    # Spécifiez ici l'adresse MAC que vous souhaitez suivre
-    target_mac_addresses = [
-    ("A4:C1:38:C9:36:78","Chambre 2"),
-    ("A4:C1:38:39:A8:57","Salon")  # Ajoutez d'autres adresses ici
-    # "AUTRE_ADRESSE_MAC"
-    ]
+    session = SessionSc()  # Récupération de la session isolée
 
-    data_folder = '/home/pi/CozyTouchAPI//MiTemperature2/data/'
+    try:
+        # Définition des adresses MAC cibles
+        target_mac_addresses = {
+            "A4:C1:38:C9:36:78": "Chambre 2",
+            "A4:C1:38:39:A8:57": "Salon"
+        }
 
-    # Lister tous les fichiers dans le dossier
-    files = os.listdir(data_folder)
+        data_folder = Path('/home/pi/CozyTouchAPI/MiTemperature2/data/')
+        file_timestamps = []
 
-    # Liste pour stocker les fichiers et leurs timestamps
-    file_timestamps = []
+        # Lister et parser les fichiers du dossier
+        for file in data_folder.glob("data_*.log"):
+            try:
+                date_time_str = file.stem[len("data_"):]  # Extraction de la date
+                timestamp = datetime.strptime(date_time_str, "%Y-%m-%d_%H-%M-%S")
+                file_timestamps.append((file, timestamp))
+            except ValueError:
+                print(f"Ignoré : {file}")
 
+        data = []
 
-    for file in files:
+        # Lecture des fichiers et extraction des données
+        for filepath, timestamp in file_timestamps:
+            with open(filepath, 'r') as file:
+                lines = file.readlines()
 
-        # Extraire la partie date_heure du nom de fichier
-        # On supprime le préfixe 'data_' et l'extension '.log'
-        date_time_str = file[len('data_'):-len('.log')]
+            for i, line in enumerate(lines):
+                for mac, room in target_mac_addresses.items():
+                    if mac in line and i + 2 < len(lines):
+                        temp_match = re.search(r"Temperature:\s*([\d.]+)", lines[i + 1])
+                        hum_match = re.search(r"Humidity:\s*(\d+)", lines[i + 2])
 
-        # Définir le format de la date et de l'heure
-        date_format = '%Y-%m-%d_%H-%M-%S'
+                        if temp_match and hum_match:
+                            data.append({
+                                "Timestamp": timestamp,
+                                "Adresse MAC": mac,
+                                "Pièce": room,
+                                "Température": float(temp_match.group(1)),
+                                "Humidité": int(hum_match.group(1))
+                            })
 
-        # Convertir la chaîne en objet datetime
-        timestamp = datetime.strptime(date_time_str, date_format)
+        # Création du DataFrame
+        if not data:
+            return
 
-        file_timestamps.append((file, timestamp))
+        df = pd.DataFrame(data).drop_duplicates(subset=["Adresse MAC", "Timestamp"])
+        df.sort_values("Timestamp", inplace=True)
 
-    # Liste pour stocker les résultats
-    data = []
+        df.rename(columns={
+            "Timestamp": "timestamp",
+            "Adresse MAC": "mac_address",
+            "Pièce": "room",
+            "Température": "temperature",
+            "Humidité": "humidity"
+        }, inplace=True)
+        
+        # Insertion optimisée en base de données
+        insert_data = df.to_dict(orient="records")
+        if insert_data:
+            stmt = insert(XiaomiTemperature).values(insert_data)
+            stmt = stmt.on_conflict_do_nothing()  # Ignore les doublons existants
+            session.execute(stmt)
 
-    # Lecture des données dans les fichiers
-    for filename, time in file_timestamps:
-        full_path = os.path.join(data_folder, filename)
+        session.commit()
 
-        # Ouvrir le fichier en mode lecture
-        with open(full_path, 'r') as file:
-            lines = file.readlines()  # Lire toutes les lignes du fichier
+        # Suppression des fichiers de plus de `deltajour` jours
+        date_limite = datetime.now() - timedelta(days=deltajour)
+        for filepath, timestamp in file_timestamps:
+            if timestamp < date_limite:
+                filepath.unlink(missing_ok=True)  # Supprime le fichier
 
-            # Parcourir les lignes avec leur index
-            for i in range(len(lines)):
-                # Chercher l'adresse MAC dans la ligne actuelle
-                for target_mac_address, room_name in target_mac_addresses:
-                    if f"{target_mac_address}" in lines[i]:
-                        # La ligne suivante contiendra la température et l'humidité
-                        if i + 1 < len(lines):  # Vérifiez que la ligne suivante existe
-                            temp_line = lines[i + 1]
-                            
-                            # Chercher la température et l'humidité dans la ligne suivante
-                            match = re.search(r"Temperature:\s*([\d.]+)", temp_line)
-                            
-                            humidity_line = lines[i + 2]
-                            match2 = re.search(r"Humidity:\s*(\d+)", humidity_line)
+    except Exception as e:
+        session.rollback()
+        print(f"Erreur dans CleaningXiaomiTemp : {e}")
 
-                            # Si une correspondance est trouvée, extraire les données
-                            if match:
-                                temperature = match.group(1)
-                                humidity = match2.group(1)
-                                
-                                # Ajouter les résultats à la liste
-                                data.append({
-                                    'Timestamp' : time,
-                                    'Adresse MAC': target_mac_address,
-                                    'Pièce': room_name,
-                                    'Température': temperature,
-                                    'Humidité': humidity
-                                })
-
-    # Créer un DataFrame à partir des données
-    df = pd.DataFrame(data)
-    df = df.drop_duplicates(subset=['Adresse MAC', 'Timestamp'])
-    df = df.sort_values(by='Timestamp')
-    df['Température'] = pd.to_numeric(df['Température'], errors='coerce')
-    df['Humidité'] = pd.to_numeric(df['Humidité'], errors='coerce')
-
-    # Insertion dans la base de donnée sqlite sans les doublons
-    for _, row in df.iterrows():
-        exists = session.query(XiaomiTemperature).filter_by(
-            timestamp=row['Timestamp'],
-            mac_address=row['Adresse MAC'],
-            room=row['Pièce'],
-            temperature=row['Température'],
-            humidity=row['Humidité']
-        ).first()
-
-        if not exists:
-            new_entry = XiaomiTemperature(
-                timestamp=row['Timestamp'],
-                mac_address=row['Adresse MAC'],
-                room=row['Pièce'],
-                temperature=row['Température'],
-                humidity=row['Humidité']
-            )
-            session.add(new_entry)
-            session.commit()  # Commit pour chaque nouvelle entrée
-
-
-    # Append des données à l'existant
-    # df_hist = pd.read_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature_data.csv')
-    # df_hist['Timestamp'] = pd.to_datetime(df_hist['Timestamp'])
-
-    # df_new = pd.concat([df, df_hist], ignore_index=True)
-
-    # df_new = df_new.drop_duplicates(subset=['Adresse MAC', 'Timestamp'])
-    # df_new = df_new.sort_values(by='Timestamp')
-
-    # Exporter le DataFrame en fichier CSV
-    # df_new.to_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature_data.csv', index=False)
-
-    # Supprimer les fichiers de plus de un jour
-
-    # df_cleaning = pd.read_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature_data.csv')
-    # df_cleaning['Timestamp'] = pd.to_datetime(df_cleaning['Timestamp'])
-
-    # Date et heure actuelle
-    current_date = datetime.now()
-
-    # Date et heure d'il y a un jour
-    yesterday_date = current_date - timedelta(days=deltajour)
-
-    for file, timestamp in file_timestamps:
-        # Vérifie si le timestamp est plus ancien que la date d'hier
-        if timestamp < yesterday_date:
-            full_path = os.path.join(data_folder, file)
-            if os.path.exists(full_path):
-                print(full_path)  # Affiche le chemin complet du fichier à supprimer
-                os.remove(full_path)  # Supprime le fichier
-
+    finally:
+        session.close()   # Nettoyage de la session après usage
 
 def MeteoAPI30minfunc():
-    # Configurer la session de cache
+    """Récupère les données météo et les stocke en base en évitant les conflits."""
+    
+    # Configuration de la session cache
     cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 
-    # Configurer le retry avec urllib3 pour le réessai automatique
     retry_strategy = Retry(
         total=5,
         backoff_factor=0.2,
@@ -248,11 +204,8 @@ def MeteoAPI30minfunc():
     cache_session.mount("http://", adapter)
 
     openmeteo = openmeteo_requests.Client(session=cache_session)
-
-    # Make sure all required weather variables are listed here
-    # The order of variables in hourly or daily is important to assign them correctly below
+    
     url = "https://api.open-meteo.com/v1/forecast"
-
     params = {
         "latitude": 48.8574,
         "longitude": 2.3795,
@@ -264,297 +217,206 @@ def MeteoAPI30minfunc():
         "forecast_minutely_15": 96
     }
 
-    responses = openmeteo.weather_api(url, params=params)
+    try:
+        responses = openmeteo.weather_api(url, params=params)
+        response = responses[0]
+        
+        minutely_15 = response.Minutely15()
+        minutely_15_data = {
+            "date": pd.date_range(
+                start=pd.to_datetime(minutely_15.Time(), unit="s", utc=True).tz_convert("Europe/Paris"),
+                end=pd.to_datetime(minutely_15.TimeEnd(), unit="s", utc=True).tz_convert("Europe/Paris"),
+                freq=pd.Timedelta(seconds=minutely_15.Interval()),
+                inclusive="left"
+            ),
+            "temperature_2m": minutely_15.Variables(0).ValuesAsNumpy(),
+            "sunshine_duration": minutely_15.Variables(1).ValuesAsNumpy(),
+            "shortwave_radiation": minutely_15.Variables(2).ValuesAsNumpy(),
+            "direct_radiation": minutely_15.Variables(3).ValuesAsNumpy(),
+        }
 
-    # Process first location. Add a for-loop for multiple locations or weather models
-    response = responses[0]
-    # print(f"Coordinates {response.Latitude()}°N {response.Longitude()}°E")
-    # print(f"Elevation {response.Elevation()} m asl")
-    # print(f"Timezone {response.Timezone()} {response.TimezoneAbbreviation()}")
-    # print(f"Timezone difference to GMT+0 {response.UtcOffsetSeconds()} s")
+        df_30min = pd.DataFrame(minutely_15_data).set_index('date').resample('30T').agg({
+            'temperature_2m': 'mean',
+            'sunshine_duration': 'sum',
+            'shortwave_radiation': 'sum',
+            'direct_radiation': 'sum'
+        })
 
-    # Process minutely_15 data. The order of variables needs to be the same as requested.
-    minutely_15 = response.Minutely15()
-    minutely_15_temperature_2m = minutely_15.Variables(0).ValuesAsNumpy()
-    minutely_15_sunshine_duration = minutely_15.Variables(1).ValuesAsNumpy()
-    minutely_15_shortwave_radiation = minutely_15.Variables(2).ValuesAsNumpy()
-    minutely_15_direct_radiation = minutely_15.Variables(3).ValuesAsNumpy()
+        df_30min['temperature_2m'] = df_30min['temperature_2m'].round(2)
+        df_30min = df_30min.reset_index()
 
-    minutely_15_data = {"date": pd.date_range(
-        start = pd.to_datetime(minutely_15.Time(), unit = "s", utc = True).tz_convert("Europe/Paris"),
-        end = pd.to_datetime(minutely_15.TimeEnd(), unit = "s", utc = True).tz_convert("Europe/Paris"),
-        freq = pd.Timedelta(seconds = minutely_15.Interval()),
-        inclusive = "left"
-    )}
-    minutely_15_data["temperature_2m"] = minutely_15_temperature_2m
-    minutely_15_data["sunshine_duration"] = minutely_15_sunshine_duration
-    minutely_15_data["shortwave_radiation"] = minutely_15_shortwave_radiation
-    minutely_15_data["direct_radiation"] = minutely_15_direct_radiation
+        session = SessionSc()
 
-    minutely_15_dataframe = pd.DataFrame(data = minutely_15_data)
- 
-    minutely_15_dataframe.set_index('date', inplace=True)
+        # Création de la liste des dictionnaires pour un insert en bulk
+        data_to_insert = df_30min.to_dict(orient="records")
 
-    # Faire un resample toutes les 30 minutes avec une agrégation personnalisée
-    df_30min = minutely_15_dataframe.resample('30T').agg({
-        'temperature_2m': 'mean',           # Moyenne des températures
-        'sunshine_duration': 'sum',         # Somme de la durée d'ensoleillement
-        'shortwave_radiation': 'sum',       # Somme de la radiation à ondes courtes
-        'direct_radiation': 'sum'           # Somme de la radiation directe
-    })
-    
-    df_30min['temperature_2m'] = df_30min['temperature_2m'].round(2)
+        if data_to_insert:
+            stmt = insert(MeteoAPI30min).values(data_to_insert)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["date"],
+                set_={
+                    "temperature_2m": stmt.excluded.temperature_2m,
+                    "sunshine_duration": stmt.excluded.sunshine_duration,
+                    "shortwave_radiation": stmt.excluded.shortwave_radiation,
+                    "direct_radiation": stmt.excluded.direct_radiation,
+                }
+            )
+            session.execute(stmt)
+            session.commit()
 
-    # df_hist_30min = pd.read_csv('/home/pi/CozyTouchAPI/data/MeteoAPI30min.csv')
-
-    # df_hist_30min['date'] = pd.to_datetime(df_hist_30min['date'])
-    # df_hist_30min.set_index('date', inplace=True)
-
-    # df_new_30min = pd.concat([df_30min, df_hist_30min], ignore_index=False)
-
-    # df_new_30min = df_new_30min.reset_index().drop_duplicates(subset=['date'])
-
-    # df_new_30min = df_new_30min.sort_values(by='date')
-
-    # Exporter le DataFrame en fichier CSV
-    # df_new_30min.to_csv('/home/pi/CozyTouchAPI/data/MeteoAPI30min.csv', index=False)
-
-    df_30min = df_30min.reset_index()
-
-    # Insérer ou mettre à jour chaque ligne
-    for _, row in df_30min.iterrows():
-        stmt = insert(MeteoAPI30min).values(
-            date=row["date"],
-            temperature_2m=row["temperature_2m"],
-            sunshine_duration=row["sunshine_duration"],
-            shortwave_radiation=row["shortwave_radiation"],
-            direct_radiation=row["direct_radiation"]
-        )
-        # On conflict, do update
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["date"],  # Colonne(s) utilisée(s) pour détecter les conflits
-            set_={
-                "temperature_2m": stmt.excluded.temperature_2m,
-                "sunshine_duration": stmt.excluded.sunshine_duration,
-                "shortwave_radiation": stmt.excluded.shortwave_radiation,
-                "direct_radiation": stmt.excluded.direct_radiation,
-            }
-        )
-        session.execute(stmt)
-
-    session.commit()
+    except OperationalError as e:
+        print(f"Erreur SQLAlchemy: {e}")
+        session.rollback()
+    finally:
+        session.close()
 
 def XiaomiTemperature30min():
-    # df = pd.read_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature_data.csv')
-    # Charger toutes les données de la table XiaomiTemperature
+    session = SessionSc()  # Récupération de la session isolée
 
-    last_6_hours = datetime.now() - timedelta(hours=6)
-
-    results = session.query(XiaomiTemperature).filter(XiaomiTemperature.timestamp >= last_6_hours).all()
-
-    data = [
-        {
-            "Timestamp": row.timestamp,
-            "Adresse MAC": row.mac_address,
-            "Pièce": row.room,
-            "Température": row.temperature,
-            "Humidité": row.humidity
-        }
-        for row in results
-    ]
-
-    df = pd.DataFrame(data)
-
-    # Convertir la colonne 'Timestamp' en type datetime avant de définir comme index
-    # df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-
-    # Vérifier et convertir les types de colonnes si nécessaire
-    # df['Température'] = pd.to_numeric(df['Température'], errors='coerce')
-    # df['Humidité'] = pd.to_numeric(df['Humidité'], errors='coerce')
-
-    # Vérification des types de données après conversion
-    # print(df.dtypes)
-
-    # Définir 'Timestamp' comme index
-    df.set_index('Timestamp', inplace=True)
-
-    # Agréger les données toutes les 30 minutes en prenant la moyenne et l'écart type, en groupant par 'Pièce' et 'Adresse MAC'
-    # df_aggregated = df.groupby(['Pièce', 'Adresse MAC']).resample('30min')['Température', 'Humidité'].agg(['mean']).reset_index()
-
-    df_aggregated = df.groupby(['Pièce', 'Adresse MAC']).resample('30min').agg(
-        moyenne_temperature=('Température', 'mean'),
-        ecart_type_temperature=('Température', 'std'),
-        moyenne_humid=('Humidité', 'mean'),
-        ecart_type_humid=('Humidité', 'std')
-    ).reset_index()
-    # Afficher le DataFrame agrégé
-
-    df_aggregated['moyenne_temperature'] = df_aggregated['moyenne_temperature'].round(2)
-    df_aggregated['moyenne_humid'] = df_aggregated['moyenne_humid'].round(2)
-
-    # Parcourir les lignes du DataFrame
-    for _, row in df_aggregated.iterrows():
-        stmt = insert(XiaomiTemperature30minModele).values(
-            timestamp=row["Timestamp"],
-            room=row["Pièce"],
-            mac_address=row["Adresse MAC"],
-            avg_temperature=row["moyenne_temperature"],
-            std_temperature=row["ecart_type_temperature"],
-            avg_humidity=row["moyenne_humid"],
-            std_humidity=row["ecart_type_humid"]
-        )
-        # En cas de conflit sur (timestamp, room), mettre à jour les autres colonnes
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["timestamp", "room"],  # Clé unique utilisée pour détecter les conflits
-            set_={
-                "mac_address": stmt.excluded.mac_address,
-                "avg_temperature": stmt.excluded.avg_temperature,
-                "std_temperature": stmt.excluded.std_temperature,
-                "avg_humidity": stmt.excluded.avg_humidity,
-                "std_humidity": stmt.excluded.std_humidity,
-            }
-        )
-        # Exécuter la requête
-        session.execute(stmt)
-
-    # Commit pour sauvegarder les modifications
-    session.commit()
-
-    # Calculer la limite de 7 jours
-    seven_days_ago = datetime.now() - timedelta(days=7)
-
-    # Supprimer les lignes avec un timestamp plus ancien que 7 jours
     try:
-        # Filtrer et supprimer
-        session.query(XiaomiTemperature).filter(XiaomiTemperature.timestamp < seven_days_ago).delete(synchronize_session=False)
+        # Récupérer les données des 6 dernières heures
+        last_6_hours = datetime.now() - timedelta(hours=6)
+        results = session.query(XiaomiTemperature).filter(XiaomiTemperature.timestamp >= last_6_hours).all()
+
+        # Transformer les résultats en DataFrame
+        data = [
+            {
+                "Timestamp": row.timestamp,
+                "Adresse MAC": row.mac_address,
+                "Pièce": row.room,
+                "Température": row.temperature,
+                "Humidité": row.humidity
+            }
+            for row in results
+        ]
+
+        df = pd.DataFrame(data)
+
+        if df.empty:  # Éviter les erreurs si aucune donnée n'est trouvée
+            return  
+
+        df.set_index('Timestamp', inplace=True)
+
+        # Agréger les données toutes les 30 minutes
+        df_aggregated = df.groupby(['Pièce', 'Adresse MAC']).resample('30min').agg(
+            moyenne_temperature=('Température', 'mean'),
+            ecart_type_temperature=('Température', 'std'),
+            moyenne_humid=('Humidité', 'mean'),
+            ecart_type_humid=('Humidité', 'std')
+        ).reset_index()
+
+        df_aggregated['moyenne_temperature'] = df_aggregated['moyenne_temperature'].round(2)
+        df_aggregated['moyenne_humid'] = df_aggregated['moyenne_humid'].round(2)
         
-        # Commit pour appliquer les changements
+        df_aggregated.rename(columns={
+            "Pièce": "room",
+            "Adresse MAC": "mac_address",
+            "moyenne_temperature": "avg_temperature",
+            "ecart_type_temperature": "std_temperature",
+            "moyenne_humid": "avg_humidity",
+            "ecart_type_humid": "std_humidity",
+            "Timestamp": "timestamp"
+        }, inplace=True)
+        
+        # Préparer les données pour un bulk insert avec upsert (on conflict)
+        insert_data = df_aggregated.to_dict(orient="records")
+
+        if insert_data:
+            stmt = insert(XiaomiTemperature30minModele).values(insert_data)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["timestamp", "room"],
+                set_={
+                    "mac_address": stmt.excluded.mac_address,
+                    "avg_temperature": stmt.excluded.avg_temperature,
+                    "std_temperature": stmt.excluded.std_temperature,
+                    "avg_humidity": stmt.excluded.avg_humidity,
+                    "std_humidity": stmt.excluded.std_humidity,
+                }
+            )
+            session.execute(stmt)
+
+        # Suppression des données détaillées de plus de 7 jours
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        session.query(XiaomiTemperature).filter(XiaomiTemperature.timestamp < seven_days_ago).delete(synchronize_session=False)
+
         session.commit()
-        # print("Les lignes de plus de 7 jours ont été supprimées avec succès.")
+
     except Exception as e:
-        # En cas d'erreur
         session.rollback()
-        # print(f"Erreur lors de la suppression : {e}")
+        print(f"Erreur dans XiaomiTemperature30min : {e}")
 
-    # df_hist_30min = pd.read_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature30min_data.csv')
-
-    # df_hist_30min['Timestamp'] = pd.to_datetime(df_hist_30min['Timestamp'])
-
-    # df_new_30min = pd.concat([df_aggregated, df_hist_30min], ignore_index=False)
-
-    # df_new_30min = df_new_30min.drop_duplicates(subset=['Timestamp','Pièce'])
-
-    # df_new_30min = df_new_30min.sort_values(by='Timestamp')
-
-    # Exporter le DataFrame en fichier CSV
-    # df_new_30min.to_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature30min_data.csv', index=False)
-
-
-
-    # Suppression des données détaillées de plus d'une semaine
-
-    # Calculer la date une semaine avant la date actuelle
-    # one_week_ago = datetime.now() - timedelta(weeks=1)
-
-    # Filtrer pour ne garder que les lignes dont l'index est postérieur à one_week_ago
-    # df_filtered = df[df.index > one_week_ago]
-
-    # df_filtered.to_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature_data.csv', index=True)
-
+    finally:
+        session.close()  # Nettoyage de la session après usage
 
 def CozyTouch30min():
-    # df = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv')
-
-    # Calculer le timestamp il y a 6 heures
-    six_hours_ago = datetime.now() - timedelta(hours=6)
-
-    recent_entries = (
-        session.query(CozyTouchTemperatureModele)
-        .filter(CozyTouchTemperatureModele.timestamp >= six_hours_ago)
-        .all()
-    )
-
-    # Convertir les résultats en une liste de dictionnaires
-    data = [{
-        'id': entry.id,
-        'piece': entry.piece,
-        'timestamp': entry.timestamp,
-        'temperature': entry.temperature,
-        'temperature cible': entry.target_temperature,
-        'consommation': entry.consumption
-    } for entry in recent_entries]
-
-    # Créer un DataFrame
-    df = pd.DataFrame(data)
-
-    # Convertir la colonne 'Timestamp' en type datetime avant de définir comme index
-    # df['timestamp'] = pd.to_datetime(df['timestamp'])
-    # Définir 'Timestamp' comme index
-
-    df.set_index('timestamp', inplace=True)
-
-    df_aggregated = df.groupby(['piece']).resample('30min').agg(
-        moyenne_temperature=('temperature', 'mean'),
-        ecart_type_temperature=('temperature', 'std'),
-        temperature_cible=('temperature cible', 'mean'),
-        consommation=('consommation', 'max')
-    ).reset_index()
-
-    df_aggregated['moyenne_temperature'] = df_aggregated['moyenne_temperature'].round(2)
-
-    for _, row in df_aggregated.iterrows():
-        stmt = insert(CozyTouchTemperature30minModele).values(
-            piece=row['piece'],
-            timestamp=row['timestamp'],
-            moyenne_temperature=row['moyenne_temperature'],
-            ecart_type_temperature=row['ecart_type_temperature'],
-            temperature_cible=row['temperature_cible'],
-            consommation=row['consommation']
-        )
-        
-        # Si le couple (timestamp, piece) existe, met à jour les autres colonnes
-        stmt = stmt.on_conflict_do_update(
-            index_elements=['timestamp', 'piece'],  # Clés pour détecter le conflit
-            set_={
-                'moyenne_temperature': stmt.excluded.moyenne_temperature,
-                'ecart_type_temperature': stmt.excluded.ecart_type_temperature,
-                'temperature_cible': stmt.excluded.temperature_cible,
-                'consommation': stmt.excluded.consommation,
-            }
-        )
-        session.execute(stmt)
+    session = SessionSc()  # Récupération de la session isolée
     
-    session.commit()
+    try:
+        # Récupérer les données des 6 dernières heures
+        six_hours_ago = datetime.now() - timedelta(hours=6)
 
-    # df_hist_30min = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch30min_data.csv')
+        recent_entries = (
+            session.query(CozyTouchTemperatureModele)
+            .filter(CozyTouchTemperatureModele.timestamp >= six_hours_ago)
+            .all()
+        )
 
-    # df_hist_30min['timestamp'] = pd.to_datetime(df_hist_30min['timestamp'])
+        # Transformer les résultats en DataFrame
+        data = [{
+            'id': entry.id,
+            'piece': entry.piece,
+            'timestamp': entry.timestamp,
+            'temperature': entry.temperature,
+            'temperature_cible': entry.target_temperature,
+            'consommation': entry.consumption
+        } for entry in recent_entries]
 
+        df = pd.DataFrame(data)
 
-    # df_new_30min = pd.concat([df_aggregated, df_hist_30min], ignore_index=False)
+        if df.empty:  # Éviter les erreurs si aucune donnée n'est trouvée
+            return  
 
-    # df_new_30min = df_new_30min.drop_duplicates(subset=['timestamp','piece'])
+        df.set_index('timestamp', inplace=True)
 
-    # df_new_30min = df_new_30min.sort_values(by='timestamp')
+        df_aggregated = df.groupby(['piece']).resample('30min').agg(
+            moyenne_temperature=('temperature', 'mean'),
+            ecart_type_temperature=('temperature', 'std'),
+            temperature_cible=('temperature_cible', 'mean'),
+            consommation=('consommation', 'max')
+        ).reset_index()
 
-    # Exporter le DataFrame en fichier CSV
-    # df_new_30min.to_csv('/home/pi/CozyTouchAPI/data/CozyTouch30min_data.csv', index=False)
+        df_aggregated['moyenne_temperature'] = df_aggregated['moyenne_temperature'].round(2)
 
-    # Suppression des données détaillées de plus d'une semaine
+        # Préparer les données pour un bulk insert avec upsert (on conflict)
+        insert_data = df_aggregated.to_dict(orient="records")
 
-    # Calculer la date une semaine avant la date actuelle
-    one_week_ago = datetime.now() - timedelta(weeks=1)
+        if insert_data:
+            stmt = insert(CozyTouchTemperature30minModele).values(insert_data)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['timestamp', 'piece'],
+                set_={
+                    'moyenne_temperature': stmt.excluded.moyenne_temperature,
+                    'ecart_type_temperature': stmt.excluded.ecart_type_temperature,
+                    'temperature_cible': stmt.excluded.temperature_cible,
+                    'consommation': stmt.excluded.consommation,
+                }
+            )
+            session.execute(stmt)
 
-    # Filtrer pour ne garder que les lignes dont l'index est postérieur à one_week_ago
-    # df_filtered = df[df.index > one_week_ago]
+        # Suppression des données détaillées de plus d'une semaine
+        one_week_ago = datetime.now() - timedelta(weeks=1)
+        session.query(CozyTouchTemperatureModele).filter(
+            CozyTouchTemperatureModele.timestamp < one_week_ago
+        ).delete(synchronize_session=False)
 
-    # df_filtered.to_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv', index=True)
+        session.commit()
 
-    # Filtrer et supprimer
-    session.query(CozyTouchTemperatureModele).filter(CozyTouchTemperatureModele.timestamp < one_week_ago).delete(synchronize_session=False)
+    except Exception as e:
+        session.rollback()
+        print(f"Erreur dans CozyTouch30min : {e}")
 
-    # Commit pour appliquer les changements
-    session.commit()
+    finally:
+        session.close()  # Nettoyage de la session après usage
 
 
 # Dictionnaire pour stocker les données de température
@@ -582,78 +444,64 @@ def format_relative_time(timestamp):
     else:
         return timestamp.strftime('%d/%m/%Y %H:%M')
 
-
 def update_temperature_data():
-    """Fonction qui met à jour les données de température pour chaque pièce."""
+    """Met à jour les données de température pour chaque pièce."""
     global temperature_data
 
     current_date = datetime.now()
 
-    # Récupérer data Xiaomi
-    # df = pd.read_csv('/home/pi/CozyTouchAPI/data/XiaomiTemperature_data.csv')
-    # df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    # df = df.sort_values(by='Timestamp')
+    session = SessionSc()
 
-    # Récupérer l'écriture la plus récente pour "Salon"
-    latest_record_salon = (
-        session.query(XiaomiTemperature)
-        .filter(XiaomiTemperature.room == "Salon")
-        .order_by(XiaomiTemperature.timestamp.desc())  # Trier par timestamp décroissant
-        .first()  # Récupérer la première ligne
-    )
-   
-    latest_record_chambre2 = (
-        session.query(XiaomiTemperature)
-        .filter(XiaomiTemperature.room == "Chambre 2")
-        .order_by(XiaomiTemperature.timestamp.desc())  # Trier par timestamp décroissant
-        .first()  # Récupérer la première ligne
-    )
-
-
-
-    # Récupérer la dernière température pour chaque pièce pour le Xiaomi
-    temperature_data["Salon"]["temperature"] = latest_record_salon.temperature
-    temperature_data["Salon"]["humidite"] = latest_record_salon.humidity
-    temperature_data["Salon"]["timestamp"] = latest_record_salon.timestamp
-    temperature_data["Chambre 2"]["temperature"] = latest_record_chambre2.temperature
-    temperature_data["Chambre 2"]["humidite"] = latest_record_chambre2.humidity
-    temperature_data["Chambre 2"]["timestamp"] = latest_record_chambre2.timestamp
-
-
-
-    # Récupérer data CozyTouch
-    # df = pd.read_csv('/home/pi/CozyTouchAPI/data/CozyTouch_data.csv')
-    # df['timestamp'] = pd.to_datetime(df['timestamp'])
-    # df = df.sort_values(by='timestamp')
+    try:
+        # Récupérer toutes les dernières valeurs en une seule requête pour éviter les appels multiples
+        latest_records = {
+            "Salon": None,
+            "Chambre 2": None
+        }
         
-    latest_record_cozy_chambre2 = (
-        session.query(CozyTouchTemperatureModele)
-        .filter(CozyTouchTemperatureModele.piece== "Chambre 2")
-        .order_by(CozyTouchTemperatureModele.timestamp.desc())  # Trier par timestamp décroissant
-        .first()  # Récupérer la première ligne
-    )
+        for room in latest_records.keys():
+            latest_records[room] = (
+                session.query(XiaomiTemperature)
+                .filter(XiaomiTemperature.room == room)
+                .order_by(XiaomiTemperature.timestamp.desc())
+                .limit(1)  # Limite à un seul résultat
+                .all()
+            )
 
-    latest_record_cozy_salon = (
-        session.query(CozyTouchTemperatureModele)
-        .filter(CozyTouchTemperatureModele.piece== "Chambre 2")
-        .order_by(CozyTouchTemperatureModele.timestamp.desc())  # Trier par timestamp décroissant
-        .first()  # Récupérer la première ligne
-    )
+        # Vérifier et mettre à jour les données de température Xiaomi
+        for room, record in latest_records.items():
+            if record:
+                record = record[0]  # Récupérer l'objet unique
+                temperature_data[room]["temperature"] = record.temperature
+                temperature_data[room]["humidite"] = record.humidity
+                temperature_data[room]["timestamp"] = record.timestamp
 
-    temperature_data["Salon"]["temperature cible"] = latest_record_cozy_salon.target_temperature
-    temperature_data["Chambre 2"]["temperature cible"] = latest_record_cozy_chambre2.target_temperature
+        # Récupérer la dernière température CozyTouch pour chaque pièce
+        latest_records_cozy = session.query(CozyTouchTemperatureModele).filter(
+            CozyTouchTemperatureModele.piece.in_(["Salon", "Chambre 2"])
+        ).order_by(CozyTouchTemperatureModele.timestamp.desc()).limit(2).all()
 
-    # Récupérer température extérieur
-    # Requête pour trouver la ligne avec la date la plus proche
-    
-    closest_entry = (
-        session.query(MeteoAPI30min)
-        .order_by(func.abs(func.julianday(MeteoAPI30min.date) - func.julianday(current_date)))
-        .first()
-    )
-    temperature_data["Exterieur"]["temperature"] = round(closest_entry.temperature_2m,1)
+        for record in latest_records_cozy:
+            temperature_data[record.piece]["temperature cible"] = record.target_temperature
 
+        # Récupérer la température extérieure avec une requête optimisée
+        closest_entry = (
+            session.query(MeteoAPI30min)
+            .order_by(func.abs(func.julianday(MeteoAPI30min.date) - func.julianday(current_date)))
+            .limit(1)  # Évite la surcharge mémoire
+            .all()
+        )
 
+        if closest_entry:
+            temperature_data["Exterieur"]["temperature"] = round(closest_entry[0].temperature_2m, 1)
+
+        session.commit()  # Valider les transactions
+
+    except OperationalError as e:
+        print(f"Erreur SQLAlchemy: {e}")
+        session.rollback()  # Annuler la transaction en cas d'erreur
+    finally:
+        session.close()  # Libérer les ressources
 
 
 @app.route('/')
@@ -691,8 +539,8 @@ if __name__ == '__main__':
     # Planifie la tâche pour qu'elle s'exécute avec une fréquence
     scheduler.add_job(func=CleaningXiaomiTemp, trigger='interval', minutes=5, args=[1])
     scheduler.add_job(func=MeteoAPI30minfunc, trigger='interval', minutes=30)
-    scheduler.add_job(func=XiaomiTemperature30min, trigger='interval', minutes=30)
-    scheduler.add_job(func=CozyTouch30min, trigger='interval', minutes=30)
+    scheduler.add_job(func=XiaomiTemperature30min, trigger='interval', minutes=20)
+    scheduler.add_job(func=CozyTouch30min, trigger='interval', minutes=20)
     scheduler.start()
 
     app.run(host='0.0.0.0', port=5075, debug=True)
